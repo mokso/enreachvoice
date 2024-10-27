@@ -1,0 +1,10 @@
+[project]
+name = "enreachvoice"
+version = "0.1"
+description = "An unofficial python client for EnreachVoice REST API. https://doc.enreachvoice.com/beneapi/#introduction"
+authors = [
+    { name="Mikko Kerava", email="mokso@iki.fi" }
+]
+dependencies = [
+    "requests"
+]
