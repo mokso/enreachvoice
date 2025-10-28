@@ -11,6 +11,8 @@ from .exceptions import (
     AuthenticationException,
     RateLimitException,
 )
+from .classifications import ClassificationMixin
+
 
 HEADERS = {
     'Content-Type': 'application/json',
@@ -20,7 +22,8 @@ HEADERS = {
 }
 DISCOVERY_URL = 'https://discover.enreachvoice.com'
 
-class Client:
+
+class Client(ClassificationMixin):
     """
     EnreachVoice API Client.
     
@@ -31,6 +34,8 @@ class Client:
         username: User email address
         secretkey: API secret key (optional if password provided)
         password: User password (optional if secretkey provided)
+        discovery_url: Custom discovery service URL (optional, for test environments)
+        api_endpoint: Direct API endpoint URL (optional, bypasses discovery)
         
     Raises:
         EnreachAPIException: If service discovery fails
@@ -38,18 +43,42 @@ class Client:
         ValueError: If neither secretkey nor password is provided
         
     Example:
+        >>> # Production usage
         >>> client = Client(username='user@example.com', secretkey='your-secret-key')
-        >>> calls = client.get_usercalls(StartTime=start, EndTime=end)
+        >>> 
+        >>> # Test environment with custom discovery
+        >>> client = Client(
+        ...     username='user@example.com',
+        ...     secretkey='your-secret-key',
+        ...     discovery_url='https://discover-test.enreachvoice.com'
+        ... )
+        >>> 
+        >>> # Direct API endpoint (bypass discovery)
+        >>> client = Client(
+        ...     username='user@example.com',
+        ...     secretkey='your-secret-key',
+        ...     api_endpoint='https://api-test.enreachvoice.com'
+        ... )
     """
     
     def __init__(
         self, 
         username: str, 
         secretkey: Optional[str] = None, 
-        password: Optional[str] = None
+        password: Optional[str] = None,
+        discovery_url: Optional[str] = None,
+        api_endpoint: Optional[str] = None
     ):
         self.username = username
-        self.apiEndpoint = self.get_apiurl()
+        self.discovery_url = discovery_url or DISCOVERY_URL
+        
+        # Allow bypassing discovery if api_endpoint is provided directly
+        if api_endpoint:
+            logging.info(f"Using provided API endpoint: {api_endpoint}")
+            self.apiEndpoint = api_endpoint.rstrip('/')
+        else:
+            self.apiEndpoint = self.get_apiurl()
+        
         self.userid: Optional[str] = None
         self.secretkey: Optional[str] = None
 
@@ -78,7 +107,7 @@ class Client:
             EnreachAPIException: If discovery fails
         """
         try:
-            url = f"{DISCOVERY_URL}/api/user?user={self.username}"
+            url = f"{self.discovery_url}/api/user?user={self.username}"
             logging.debug(f"Invoking discovery: {url}")
             discoveryResponse = requests.get(url)
             if discoveryResponse.status_code != 200:
@@ -420,11 +449,3 @@ class Client:
                 logging.info(f"Retrieved transcript status: {status}")
         
         return transcript
-
-            
-                
-
-
-
-
- 

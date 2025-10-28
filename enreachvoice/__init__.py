@@ -9,11 +9,16 @@ Example usage:
     >>> calls = client.get_usercalls(StartTime=start, EndTime=end)
 """
 
-from .restapi import Client
+from .client import Client
 from .exceptions import (
     EnreachAPIException,
     AuthenticationException,
     RateLimitException,
+)
+from .types import (
+    TagSelection,
+    ClassificationInstance,
+    ClassifiedType,
 )
 
 __version__ = '0.2.0'
@@ -22,4 +27,7 @@ __all__ = [
     'EnreachAPIException',
     'AuthenticationException',
     'RateLimitException',
+    'TagSelection',
+    'ClassificationInstance',
+    'ClassifiedType',
 ]
