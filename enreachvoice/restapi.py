@@ -3,7 +3,14 @@ import requests
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Union, cast
 import time
+
+from .exceptions import (
+    EnreachAPIException,
+    AuthenticationException,
+    RateLimitException,
+)
 
 HEADERS = {
     'Content-Type': 'application/json',
@@ -14,42 +21,61 @@ HEADERS = {
 DISCOVERY_URL = 'https://discover.enreachvoice.com'
 
 class Client:
-    def __init__(self, username, secretkey=None, password=None):
+    """
+    EnreachVoice API Client.
+    
+    This client provides access to the EnreachVoice REST API for managing
+    calls, users, queues, and other telephony resources.
+    
+    Args:
+        username: User email address
+        secretkey: API secret key (optional if password provided)
+        password: User password (optional if secretkey provided)
+        
+    Raises:
+        EnreachAPIException: If service discovery fails
+        AuthenticationException: If authentication fails
+        ValueError: If neither secretkey nor password is provided
+        
+    Example:
+        >>> client = Client(username='user@example.com', secretkey='your-secret-key')
+        >>> calls = client.get_usercalls(StartTime=start, EndTime=end)
+    """
+    
+    def __init__(
+        self, 
+        username: str, 
+        secretkey: Optional[str] = None, 
+        password: Optional[str] = None
+    ):
         self.username = username
-        apiEndpoint = self.get_apiurl()
-        if apiEndpoint is None:
-            return
-        self.apiEndpoint = apiEndpoint
+        self.apiEndpoint = self.get_apiurl()
+        self.userid: Optional[str] = None
+        self.secretkey: Optional[str] = None
 
-        if (secretkey is not None):
+        if secretkey is not None:
             logging.debug("Using provided secretkey")
             self.secretkey = secretkey
         else:
             logging.debug("No secretkey provided")
-            if (password is None):
-                logging.error("Either secretkey or password must be provided")
-                return
-            logging.debug("Got password, using that to retieve secretkey")
-            secretkey = self.authenticate_with_password(password)
-            if secretkey is None:
-                logging.error("Failed to authenticate")
-                return
-            self.secretkey = secretkey
+            if password is None:
+                raise ValueError("Either secretkey or password must be provided")
+            logging.debug("Got password, using that to retrieve secretkey")
+            self.secretkey = self.authenticate_with_password(password)
 
         user = self.invoke_api(method='GET', path='users/me')
-        if user is None:
-            logging.error("Failed to get user id")
-            return
         self.userid = user['Id']
 
-    def get_apiurl(self):
+    def get_apiurl(self) -> str:
         """
         Invoke discovery service to get the API endpoint.
         https://doc.enreachvoice.com/beneapi/#service-discovery
 
         Returns:
-        str: API endpoint if successful, None otherwise
-
+            API endpoint URL
+            
+        Raises:
+            EnreachAPIException: If discovery fails
         """
         try:
             url = f"{DISCOVERY_URL}/api/user?user={self.username}"
@@ -57,234 +83,346 @@ class Client:
             discoveryResponse = requests.get(url)
             if discoveryResponse.status_code != 200:
                 logging.error(f"Discovery failed: {discoveryResponse.status_code} {discoveryResponse.text}")
-                return None
+                raise EnreachAPIException(
+                    f"Discovery failed with status {discoveryResponse.status_code}",
+                    status_code=discoveryResponse.status_code,
+                    response=discoveryResponse.text
+                )
             logging.debug(f"Discovery response: {json.dumps(discoveryResponse.json(),indent=2)}")
-            apiEndpoint = discoveryResponse.json()[0]['apiEndpoint']
+            apiEndpoint: str = discoveryResponse.json()[0]['apiEndpoint']
             # if api url has ending slash, remove it
             if apiEndpoint[-1] == '/':
                 apiEndpoint = apiEndpoint[:-1]
             logging.info(f"API endpoint: {apiEndpoint}")
             return apiEndpoint
+        except requests.RequestException as e:
+            logging.error(f"Network error invoking discovery: {e}")
+            raise EnreachAPIException(f"Network error during discovery: {e}")
+        except (KeyError, IndexError, ValueError) as e:
+            logging.error(f"Invalid discovery response: {e}")
+            raise EnreachAPIException(f"Invalid discovery response: {e}")
+        except EnreachAPIException:
+            raise
         except Exception as e:
             logging.error(f"Error invoking discovery: {e}")
-            return None
+            raise EnreachAPIException(f"Unexpected error during discovery: {e}")
 
-    def invoke_api(self, path, method='GET', params=None, payload=None):
+    def invoke_api(
+        self, 
+        path: str, 
+        method: str = 'GET', 
+        params: Optional[Dict[str, Any]] = None, 
+        payload: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Invoke the EnreachVoice API with the given method, path, parameters and payload.
 
         Args:
-        path (str): Path to the API endpoint
-        method (str): HTTP method to use. Default is 'GET'
-        params (dict): Query parameters to send with the request
-        payload (dict): Payload to send with the request
+            path: Path to the API endpoint
+            method: HTTP method to use. Default is 'GET'
+            params: Query parameters to send with the request
+            payload: Payload to send with the request
 
         Returns:
-        dict: API response if successful, None otherwise
+            API response as dictionary
+            
+        Raises:
+            ValueError: If method or path is invalid
+            EnreachAPIException: If API request fails
         """
+        # ensure we have a valid method
+        if method not in ['GET', 'POST', 'PUT', 'DELETE']:
+            raise ValueError(f"Invalid method: {method}. Must be GET, POST, PUT, or DELETE")
+        
+        # ensure we have a valid path
+        if path is None:
+            raise ValueError("Path must be provided")
+        
+        #ensure path starts with a slash
+        if path[0] != '/':
+            path = '/' + path
 
+        url = f"{self.apiEndpoint}{path}"
+        logging.debug(f"Invoking {method}: {url}")
+        
         try:
-            # ensure we have a valid method
-            if method not in ['GET', 'POST', 'PUT', 'DELETE']:
-                logging.error(f"Invalid method: {method}")
-                return None
-            # ensure we have a valid path
-            if path is None:
-                logging.error("Path must be provided")
-                return None
-            #ensure path starts with a slash
-            if path[0] != '/':
-                path = '/' + path
-
-            url = f"{self.apiEndpoint}{path}"
-            logging.debug(f"Invoking {method}: {url}")
             start_time = time.time()
             if method == 'GET':
-                response = requests.get(url, headers=HEADERS, auth=(self.username, self.secretkey), params=params)
+                response = requests.get(url, headers=HEADERS, auth=(self.username, cast(str, self.secretkey)), params=params)
             elif method == 'POST':
-                response = requests.post(url, headers=HEADERS, auth=(self.username, self.secretkey), params=params, data=(json.dumps(payload)))
+                response = requests.post(url, headers=HEADERS, auth=(self.username, cast(str, self.secretkey)), params=params, data=(json.dumps(payload)))
             elif method == 'PUT':
-                response = requests.put(url, headers=HEADERS, auth=(self.username, self.secretkey), params=params, data=(json.dumps(payload)))
+                response = requests.put(url, headers=HEADERS, auth=(self.username, cast(str, self.secretkey)), params=params, data=(json.dumps(payload)))
             elif method == 'DELETE':
-                response = requests.delete(url, headers=HEADERS, auth=(self.username, self.secretkey), params=params)
-            duration_ms = (time.time() - start_time) * 1000
-            logging.debug(f"Got response {response.status_code} in {duration_ms} ms: {json.dumps(response.json(),indent=2)}")
+                response = requests.delete(url, headers=HEADERS, auth=(self.username, cast(str, self.secretkey)), params=params)
             
-            if response.ok is not True:
-                logging.error(f"API request failed: {response.status_code} {response.text}")
-                return None            
-            return response.json()
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Try to parse JSON response
+            try:
+                json_response: Dict[str, Any] = response.json()
+                logging.debug(f"Got response {response.status_code} in {duration_ms:.2f} ms: {json.dumps(json_response, indent=2)}")
+            except ValueError as e:
+                logging.error(f"Invalid JSON response: {response.text}")
+                raise EnreachAPIException(
+                    f"API returned invalid JSON: {str(e)}",
+                    status_code=response.status_code,
+                    response=response.text
+                )
+            
+            # Check response status
+            if response.status_code == 401:
+                raise AuthenticationException(
+                    "Authentication failed. Check your credentials.",
+                    status_code=response.status_code,
+                    response=json_response
+                )
+            elif response.status_code == 404:
+                raise EnreachAPIException(
+                    f"Resource not found: {path}",
+                    status_code=response.status_code,
+                    response=json_response
+                )
+            elif response.status_code == 429:
+                raise RateLimitException(
+                    "API rate limit exceeded. Please retry later.",
+                    status_code=response.status_code,
+                    response=json_response
+                )
+            elif not response.ok:
+                raise EnreachAPIException(
+                    f"API request failed: {response.status_code}",
+                    status_code=response.status_code,
+                    response=json_response
+                )
+            
+            return json_response
+            
+        except (AuthenticationException, RateLimitException, EnreachAPIException):
+            raise
+        except requests.RequestException as e:
+            logging.error(f"Network error while invoking REST API: {e}")
+            raise EnreachAPIException(f"Network error: {str(e)}")
         except Exception as e:
-            logging.error(f"Error while invoking REST API: {e}")
-            return None
+            logging.error(f"Unexpected error while invoking REST API: {e}")
+            raise EnreachAPIException(f"Unexpected error: {str(e)}")
 
-    def authenticate_with_password(self, password):
+    def authenticate_with_password(self, password: str) -> str:
         """
         Authenticate with the EnreachVoice API using the provided user password.
         https://doc.enreachvoice.com/beneapi/#post-authuser-email
 
         Args:
-        password (str): User password
+            password: User password
 
         Returns:
-        str: Secretkey if successful, None otherwise
+            Secret key for API authentication
+            
+        Raises:
+            AuthenticationException: If authentication fails
         """
         try:
-            url =f"{self.apiEndpoint}/authuser/{self.username}"
+            url = f"{self.apiEndpoint}/authuser/{self.username}"
             payload = {
                 'UserName': self.username,
                 'Password': password,
             }
-            logging.debug(f"Invoking POST: {url} {json.dumps(payload,indent=2)}")
+            logging.debug(f"Invoking POST: {url}")
             response = requests.post(url, headers=HEADERS, data=json.dumps(payload))
             if response.status_code != 200:
                 logging.error(f"Authentication failed: {response.status_code} {response.text}")
-                return None
+                raise AuthenticationException(
+                    f"Authentication failed with status {response.status_code}",
+                    status_code=response.status_code,
+                    response=response.text
+                )
                         
             logging.debug(f"API response: {json.dumps(response.json(),indent=2)}")
-            secretkey = response.json()['SecretKey']
-            logging.info(f"User {self.username}uthenticated successfully")
+            secretkey: str = response.json()['SecretKey']
+            logging.info(f"User {self.username} authenticated successfully")
             return secretkey
+        except AuthenticationException:
+            raise
+        except requests.RequestException as e:
+            logging.error(f"Network error during authentication: {e}")
+            raise AuthenticationException(f"Network error during authentication: {e}")
+        except (KeyError, ValueError) as e:
+            logging.error(f"Invalid authentication response: {e}")
+            raise AuthenticationException(f"Invalid authentication response: {e}")
         except Exception as e:
             logging.error(f"Error authenticating: {e}")
-            return None
+            raise AuthenticationException(f"Unexpected error during authentication: {e}")
                
-    def get_usercalls(self, **filterParameters):
+    def get_usercalls(self, **filterParameters: Any) -> List[Dict[str, Any]]:
         """
-        Get user call events. That is, call evets that are associated to a user. The same callId can be
+        Get user call events. That is, call events that are associated to a user. The same callId can be
         associated to multiple call events.
 
         https://doc.enreachvoice.com/beneapi/#get-calls
 
         Args:
-        filterParameters (dict): Filter parameters to apply to the call events query
-        https://doc.enreachvoice.com/beneapi/#callfilterparameters
-        Give 'DateTime' as datetime objects, they will be converted to proper string format
+            **filterParameters: Filter parameters to apply to the call events query
+                https://doc.enreachvoice.com/beneapi/#callfilterparameters
+                Give 'DateTime' as datetime objects, they will be converted to proper string format
         
         Returns:
-        dict: User calls if successful, None otherwise
+            List of user calls
+            
+        Raises:
+            ValueError: If filter parameters are invalid
+            EnreachAPIException: If API request fails
         """
-        try:
+        logging.debug(f"Filter parameters: {json.dumps(filterParameters,indent=2,default=str)}")
+        # Ensure we have either StartTime and EndTime, ModifiedAfter and ModifiedBefore, or CallId
+        # Time range cannot be more than 31 days
+        # Times must be given in proper string format in UTC, like "2015-01-01 06:00:00"
 
-            logging.debug(f"Filter parameters: {json.dumps(filterParameters,indent=2,default=str)}")
-            # Ensure we have eithre StartTime and EndTime, ModifiedAfter and ModifiedBefore, or CallId
-            # Time range cannot be more than 31 days
-            # Times must be given in proper string format in UTC, like "2015-01-01 06:00:00"
+        if 'StartTime' in filterParameters and 'EndTime' in filterParameters:
+            st = filterParameters['StartTime']
+            filterParameters['StartTime'] = st.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            et = filterParameters['EndTime']
+            filterParameters['EndTime'] = et.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            if 'StartTime' in filterParameters and 'EndTime' in filterParameters:
-                st = filterParameters['StartTime']
-                filterParameters['StartTime'] = st.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                et = filterParameters['EndTime']
-                filterParameters['EndTime'] = et.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if (et - st).days > 31:
+                raise ValueError("Time range cannot be more than 31 days")
+        elif 'ModifiedAfter' in filterParameters and 'ModifiedBefore' in filterParameters:
+            ma = filterParameters['ModifiedAfter']
+            filterParameters['ModifiedAfter'] = ma.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            mb = filterParameters['ModifiedBefore']
+            filterParameters['ModifiedBefore'] = mb.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-                if (et - st).days > 31:
-                    logging.error("Time range cannot be more than 31 days")
-                    return None
-            elif 'ModifiedAfter' in filterParameters and 'ModifiedBefore' in filterParameters:
-                    ma = filterParameters['ModifiedAfter']
-                    filterParameters['ModifiedAfter'] = ma.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    mb = filterParameters['ModifiedBefore']
-                    filterParameters['ModifiedBefore'] = mb.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if (mb - ma).days > 31:
+                raise ValueError("Time range cannot be more than 31 days")
+        elif 'CallId' in filterParameters:
+            pass
+        else:
+            raise ValueError("Must have StartTime and EndTime or ModifiedAfter and ModifiedBefore")
+        
+        calls_response = self.invoke_api(method='GET', path='/calls', params=filterParameters)
+        calls = cast(List[Dict[str, Any]], calls_response)
+        
+        logging.info(f"Retrieved {len(calls)} calls")
+        return calls
 
-                    if (mb - ma).days > 31:
-                        logging.error("Time range cannot be more than 31 days")
-                        return None
-            elif 'CallId' in filterParameters:
-                pass
-            else:
-                logging.error("Must have StartTime and EndTime, ModifiedAfter and ModifiedBefore, or CallId")
-                return None
-            
-            calls = self.invoke_api(method='GET', path='/calls', params=filterParameters)
-            
-            logging.info(f"Retrieved {len(calls)} calls")
-            return calls
-        except Exception as e:
-            logging.error(f"Error getting user calls: {e}")
-            return None
-
-    def get_inbound_queuecalls(self, **filterParameters):
+    def get_inbound_queuecalls(self, **filterParameters: Any) -> List[Dict[str, Any]]:
         """
         Get inbound queuecalls aka. servicecalls.
         https://doc.enreachvoice.com/beneapi/#get-servicecall
 
-
         Args:
-        filterParameters (dict): Filter parameters to apply to the servicecall query
-        https://doc.enreachvoice.com/beneapi/#servicecallfilterparameters
-        Give 'DateTime' as datetime objects, they will be converted to proper string format
+            **filterParameters: Filter parameters to apply to the servicecall query
+                https://doc.enreachvoice.com/beneapi/#servicecallfilterparameters
+                Give 'DateTime' as datetime objects, they will be converted to proper string format
         
         Returns:
-        dict: Service calls if successful, None otherwise
-        """
-        try:
-            logging.debug(f"Filter parameters: {json.dumps(filterParameters,indent=2,default=str)}")
-            # Ensure we have eithre StartTime and EndTime, ModifiedAfter and ModifiedBefore, or CallId
-            # Time range cannot be more than 31 days
-            # Times must be given in proper string format in UTC, like "2015-01-01 06:00:00"
-
-            if 'StartTime' in filterParameters and 'EndTime' in filterParameters:
-                st = filterParameters['StartTime']
-                filterParameters['StartTime'] = st.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                et = filterParameters['EndTime']
-                filterParameters['EndTime'] = et.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-                if (et - st).days > 31:
-                    logging.error("Time range cannot be more than 31 days")
-                    return None
-            elif 'ModifiedAfter' in filterParameters and 'ModifiedBefore' in filterParameters:
-                    ma = filterParameters['ModifiedAfter']
-                    filterParameters['ModifiedAfter'] = ma.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    mb = filterParameters['ModifiedBefore']
-                    filterParameters['ModifiedBefore'] = mb.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-                    if (mb - ma).days > 31:
-                        logging.error("Time range cannot be more than 31 days")
-                        return None
-            else:
-                logging.error("Must have StartTime and EndTime or ModifiedAfter and ModifiedBefore")
-                return None
+            List of service calls
             
-            calls = self.invoke_api(method='GET', path='/servicecall', params=filterParameters)
-            return calls
-        except Exception as e:
-            logging.error(f"Error getting service calls: {e}")
-            return None
+        Raises:
+            ValueError: If filter parameters are invalid
+            EnreachAPIException: If API request fails
+        """
+        logging.debug(f"Filter parameters: {json.dumps(filterParameters,indent=2,default=str)}")
+        # Ensure we have either StartTime and EndTime, or ModifiedAfter and ModifiedBefore
+        # Time range cannot be more than 31 days
+        # Times must be given in proper string format in UTC, like "2015-01-01 06:00:00"
+
+        if 'StartTime' in filterParameters and 'EndTime' in filterParameters:
+            st = filterParameters['StartTime']
+            filterParameters['StartTime'] = st.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            et = filterParameters['EndTime']
+            filterParameters['EndTime'] = et.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            if (et - st).days > 31:
+                raise ValueError("Time range cannot be more than 31 days")
+        elif 'ModifiedAfter' in filterParameters and 'ModifiedBefore' in filterParameters:
+            ma = filterParameters['ModifiedAfter']
+            filterParameters['ModifiedAfter'] = ma.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            mb = filterParameters['ModifiedBefore']
+            filterParameters['ModifiedBefore'] = mb.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+            if (mb - ma).days > 31:
+                raise ValueError("Time range cannot be more than 31 days")
+        else:
+            raise ValueError("Must have StartTime and EndTime or ModifiedAfter and ModifiedBefore")
+        
+        calls = self.invoke_api(method='GET', path='/servicecall', params=filterParameters)
+        logging.info(f"Retrieved {len(calls)} service calls")
+        return cast(List[Dict[str, Any]], calls)
 
 
-    def get_recording_file(self, recordingId, path):
+    def get_recording_file(self, recordingId: str, path: str) -> None:
         """
         Download recording to mp3-file.
         https://doc.enreachvoice.com/beneapi/#get-calls-recordings-recordingid
 
         Args:
-        recordingId (str): RecordingId of the recording to get
-        path (str): Path directory to save the recording file. File will be saved as <recordingId>.mp3
+            recordingId: RecordingId of the recording to get
+            path: Path directory to save the recording file. File will be saved as <recordingId>.mp3
+            
+        Raises:
+            EnreachAPIException: If recording download fails
+        """
+        # ensure path exists
+        os.makedirs(path, exist_ok=True)
+
+        url = f"{self.apiEndpoint}/calls/recordings/{recordingId}"
+        logging.debug(f"Invoking GET: {url}")
+        recording_response = requests.get(url, headers=HEADERS, auth=(self.username, cast(str, self.secretkey)))
+        if recording_response.status_code != 200:
+            logging.error(f"Get recording failed: {recording_response.status_code} {recording_response.text}")
+            raise EnreachAPIException(
+                f"Failed to get recording metadata: {recording_response.status_code}",
+                status_code=recording_response.status_code,
+                response=recording_response.text
+            )
+        recording_metadata = recording_response.json()
+        logging.info(f"Retrieved recording metadata: {json.dumps(recording_metadata,indent=2)}")
+        recordingUrl = f"{self.apiEndpoint}/{recording_metadata['URL']}"
+        logging.debug(f"Invoking GET: {recordingUrl}")
+        recording_audio = requests.get(recordingUrl)    
+
+        with open(f"{path}/{recordingId}.mp3", 'wb') as f:
+            f.write(recording_audio.content)
+        logging.info(f"Recording file saved to {path}/{recordingId}.mp3")
+
+
+    def get_transcript(self, transcriptId: str, wait_pending: bool = True) -> Dict[str, Any]:
+        """
+        Get transcript by transcriptId.
+
+        Args:
+            transcriptId: TranscriptId of the transcript to get
+            wait_pending: If True, wait for pending transcript to be ready. Default is True
 
         Returns:
+            Transcript data
+            
+        Raises:
+            EnreachAPIException: If transcript retrieval fails
         """
-        try:
-            # ensure path exists
-            os.makedirs(path, exist_ok=True)
+        # GET /calls/transcripts/{transcriptId}
+        path = f"/calls/transcripts/{transcriptId}"
+        transcript = self.invoke_api(method='GET', path=path)
+        
+        # check status, if pending, wait for it to be ready
+        status = transcript['TranscriptStatus']
+        if status == 'Pending' and wait_pending:
+            max_retries = 10
+            retries = 0
+            while status == 'Pending':
+                if retries >= max_retries:
+                    raise EnreachAPIException(f"Transcript {transcriptId} still pending after {max_retries} retries")
+                
+                retries += 1
+                time.sleep(10)
+                transcript = self.invoke_api(method='GET', path=path)
+                status = transcript['TranscriptStatus']
+                logging.info(f"Retrieved transcript status: {status}")
+        
+        return transcript
 
-            url = f"{self.apiEndpoint}/calls/recordings/{recordingId}"
-            logging.debug(f"Invoking GET: {url}")
-            recording_response = requests.get(url, headers=HEADERS, auth=(self.username, self.secretkey))
-            if recording_response.status_code != 200:
-                logging.error(f"Get recording failed: {recording_response.status_code} {recording_response.text}")
-                return None
-            recording_metadata = recording_response.json()
-            logging.info(f"Retrieved recording metadata: {json.dumps(recording_metadata,indent=2)}")
-            recordingUrl = f"{self.apiEndpoint}/{recording_metadata['URL']}"
-            logging.debug(f"Invoking GET: {recordingUrl}")
-            recording_audio = requests.get(recordingUrl)    
-
-            with open(f"{path}/{recordingId}.mp3", 'wb') as f:
-                f.write(recording_audio.content)
-            logging.info(f"Recording file saved to {path}/{recordingId}.mp3")
-        except Exception as e:
-            logging.error(f"Error getting recording file: {e}")
-            return None
+            
+                
 
 
 
